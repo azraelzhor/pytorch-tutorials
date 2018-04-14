@@ -87,7 +87,7 @@ class Encoder(torch.nn.Module):
         super(Encoder, self).__init__()
         self.H = hidden_size
         self.word_embeddings = torch.nn.Embedding(vocab_size, hidden_size)
-        self.rnn = torch.nn.GRU(hidden_size, hidden_size)
+        self.gru = torch.nn.GRU(hidden_size, hidden_size)
         self.hidden = self.init_hidden()
 
     def init_hidden(self):
@@ -95,7 +95,7 @@ class Encoder(torch.nn.Module):
 
     def forward(self, input):
         embeds = self.word_embeddings(input).view(len(input), 1, -1)
-        gru_out, self.hidden = self.rnn(embeds, self.hidden)
+        gru_out, self.hidden = self.gru(embeds, self.hidden)
         return gru_out
 
 class Decoder(torch.nn.Module):
@@ -110,27 +110,28 @@ class Decoder(torch.nn.Module):
         self.gru = torch.nn.GRU(hidden_size, hidden_size)
         self.relu = torch.nn.ReLU()
         self.linear = torch.nn.Linear(hidden_size, vocab_size)
-        self.softmax = torch.nn.LogSoftmax(dim=1)
+        self.log_softmax = torch.nn.LogSoftmax(dim=1)
 
     def forward(self, input):
         z = self.word_embeddings(input).view(len(input), 1, -1)
         z_relu = self.relu(z)
         gru_out, self.hidden = self.gru(z_relu, self.hidden)
         out = self.linear(gru_out.view(-1, self.H))
-        out = self.softmax(out)
+        out = self.log_softmax(out)
         return out
 
-# train model
-NUM_EPOCH = 10000
+torch.manual_seed(2018)
+
+NUM_EPOCH = 1500
 LEARNING_RATE = 0.008
 EMBEDDING_DIM = 6
-HIDDEN_SIZE = 10
+HIDDEN_SIZE = 20
 MAX_LENGTH = 5
 
 BEGIN_TOKEN = "SOS"
 END_TOKEN = "EOS"
 
-input_lang, output_lang, pairs = prepare_data('sim', 'la', reverse=False)
+input_lang, output_lang, pairs = prepare_data('sim', 'la', reverse=True)
 
 def train_without_attention():
 
@@ -156,11 +157,14 @@ def train_without_attention():
 
             decoder.hidden = encoder.hidden
             decoded_outputs = []
+            decoded_words = []
             for i in range(len(target_tensor)):
                 output_tensor = decoder(decoder_input_tensor)
                 decoded_outputs.append(output_tensor)
                 _, index = output_tensor.data[0].topk(1)
                 decoder_input_tensor = Variable(index)
+                decoded_word = output_lang.i2w[index[0]]
+                decoded_words.append(decoded_word)
 
             decoded_outputs = torch.cat(decoded_outputs)
 
@@ -170,8 +174,11 @@ def train_without_attention():
             total_loss += loss
 
             optimizer.step()
+        
+        print('Epoch %d, loss = %f' % (epoch + 1, total_loss.data[0] / len(pairs))
 
-        print(total_loss.data[0])
+    for input_sent, target_sent in pairs:
+        print(evaluate_no_attention(encoder, decoder, input_sent), target_sent)
 
 class AttentionDecoder(torch.nn.Module):
     def __init__(self,vocab_size, hidden_size, max_length=MAX_LENGTH):
@@ -227,10 +234,59 @@ class AttentionDecoder(torch.nn.Module):
 
         return out, gru_hidden
 
+class AttDecoder(torch.nn.Module):
+    def __init__(self,vocab_size, hidden_size):
+        super(AttDecoder, self).__init__()
+        self.H = hidden_size
+        self.word_embeddings = torch.nn.Embedding(vocab_size, self.H)
+        self.softmax = torch.nn.Softmax(dim=1)
+        self.alignment = torch.nn.Linear(2 * self.H, 1)
+        self.combine = torch.nn.Linear(2 * self.H, self.H)
+        self.gru = torch.nn.GRU(self.H, self.H)
+        self.out = torch.nn.Linear(self.H, vocab_size)
+        self.log_softmax = torch.nn.LogSoftmax(dim=1)
+
+    def forward(self, input, hidden, encoded_outputs):
+        '''
+        Args
+        input: index
+        hidden: (s_i-1, 1 x 1 x H) 
+        encoded_outputs: (S x 1 x H)
+        '''
+        S = encoded_outputs.size()[0]
+        # 1 x 1 x H
+        embeds = self.word_embeddings(input).view(1, 1, -1)
+
+        # (S x 1 x H, 1 x 1 x H) => S x 2H
+        hidden_combined = torch.cat([encoded_outputs, hidden.repeat(S, 1, 1)], dim=2).view(S, -1)
+
+        # 1 x S
+        weights = self.alignment(hidden_combined).view(1, -1)
+
+        # 1 x S
+        weights_softmax = self.softmax(weights)
+        
+        # 1 x S => repeat => H x 1 x S => transpose => S x 1 x H => * => S x 1 x H => sum(dim=0, keepdim=True) => 1 x 1 x H
+        context = (weights_softmax.repeat(self.H, 1, 1).transpose(2, 0) * encoded_outputs).sum(dim=0, keepdim=True)
+
+        # 1 x 1 x H cat 1 x 1 x H => 1 x (H + H)
+        input_context_combined = torch.cat([embeds, context], dim=2).view(1, -1)
+
+        # 1 x H => unsqueeze => 1 x 1 x H
+        gru_in = self.combine(input_context_combined).unsqueeze(0)
+
+        # 1 x 1 x H, 1 x 1 x H
+        gru_out, gru_hidden = self.gru(gru_in, hidden)
+
+        out = self.out(gru_out.view(-1, self.H))
+        out = self.log_softmax(out)
+
+        return out, gru_hidden
+
 def train_with_attention():
 
     encoder = Encoder(input_lang.vocab_size, HIDDEN_SIZE)
-    attention_decoder = AttentionDecoder(output_lang.vocab_size, HIDDEN_SIZE)
+    attention_decoder = AttDecoder(output_lang.vocab_size, HIDDEN_SIZE)
     criterion = torch.nn.NLLLoss()
     optimizer = torch.optim.SGD(list(encoder.parameters()) + list(attention_decoder.parameters()), lr=LEARNING_RATE)
 
@@ -266,9 +322,28 @@ def train_with_attention():
 
             optimizer.step()
 
-        print('Epoch %d, loss = %f' % (epoch + 1, total_loss.data[0]))
+        print('Epoch %d, loss = %f' % (epoch + 1, total_loss.data[0] / len(pairs)))
 
-    print(evaluate(encoder, attention_decoder, "no way"))
+    for input_sent, target_sent in pairs:
+        print(evaluate(encoder, attention_decoder, input_sent), target_sent)
+
+def evaluate_no_attention(encoder, decoder, sentence):
+    encoder_input_tensor = make_tensor(sentence, input_lang)
+    encoded_outputs = encoder(encoder_input_tensor)
+
+    decoder_input_tensor = make_tensor(BEGIN_TOKEN, output_lang)
+    decoder.hidden = encoder.hidden    
+    decoded_words = []
+    for i in range(MAX_LENGTH):
+        output_tensor = decoder(decoder_input_tensor)
+        _, index = output_tensor.data[0].topk(1)
+        decoded_word = output_lang.i2w[index[0]]
+        decoded_words.append(decoded_word)
+        if decoded_word == END_TOKEN:
+            break
+        decoder_input_tensor = Variable(index)
+
+    return decoded_words
 
 def evaluate(encoder, attention_decoder, sentence):
     encoder_input_tensor = make_tensor(sentence, input_lang)
